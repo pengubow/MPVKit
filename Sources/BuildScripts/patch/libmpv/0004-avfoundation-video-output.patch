@@ -7,8 +7,8 @@ Subject: [PATCH] AVfoundation video output
  meson.build                 |   15 +
  meson.options               |    1 +
  video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 1288 +++++++++++++++++++++++++++++++++++
- 4 files changed, 1308 insertions(+)
+ video/out/vo_avfoundation.m | 1944 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 1964 insertions(+)
  create mode 100644 video/out/vo_avfoundation.m
 
 diff --git a/meson.build b/meson.build
@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,1288 @@
+@@ -0,0 +1,1944 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -119,6 +119,40 @@ index 0000000000..1b3e13aece
 +#import <AppKit/AppKit.h>
 +#endif
 +
++struct avf_render_geometry {
++    int w, h;
++    struct mp_rect src, dst;
++    struct mp_osd_res osd_res;
++};
++
++enum avf_osd_draw_path {
++    AVF_OSD_DRAW_NONE = 0,
++    AVF_OSD_DRAW_DIRECT_LIBASS,
++    AVF_OSD_DRAW_DIRECT_BGRA,
++    AVF_OSD_DRAW_COREGRAPHICS,
++};
++
++struct avf_osd_render_stats {
++    int64_t geometry_ns;
++    int64_t osd_draw_ns;
++    int64_t callback_ns;
++    int64_t buffer_ns;
++    int64_t context_ns;
++    int64_t bitmap_draw_ns;
++    int callbacks;
++    int parts;
++    int format;
++    int draw_path;
++    int64_t src_pixels;
++    int64_t dst_pixels;
++    int bbox_x0, bbox_y0, bbox_x1, bbox_y1;
++    bool has_bbox;
++    bool has_output;
++    bool cache_hit;
++    bool rendered;
++    bool cleared;
++};
++
 +struct priv {
 +    struct mp_hwdec_ctx hwctx;
 +
@@ -133,6 +167,9 @@ index 0000000000..1b3e13aece
 +    int64_t osd_change_id;
 +    int osd_w, osd_h;
 +    struct mp_osd_res osd_res;
++    struct avf_render_geometry render_geometry;
++    struct avf_osd_render_stats osd_stats;
++    bool render_geometry_valid;
 +    CVPixelBufferPoolRef osdPool;
 +    int osd_pool_w, osd_pool_h;
 +    bool osd_needs_enqueue;
@@ -144,6 +181,7 @@ index 0000000000..1b3e13aece
 +    CVPixelBufferPoolRef outputPool;
 +    int output_pool_w, output_pool_h;
 +    CGImageRef cachedSubtitleImage;
++    CVPixelBufferRef cachedSubtitleBuffer;
 +    bool has_subtitle;
 +
 +    // Software frame upload support
@@ -159,12 +197,6 @@ index 0000000000..1b3e13aece
 +
 +};
 +
-+struct avf_render_geometry {
-+    int w, h;
-+    struct mp_rect src, dst;
-+    struct mp_osd_res osd_res;
-+};
-+
 +static CGFloat get_screen_scale(void)
 +{
 +#if TARGET_OS_IPHONE
@@ -173,6 +205,79 @@ index 0000000000..1b3e13aece
 +    NSScreen *screen = [NSScreen mainScreen];
 +    return screen ? screen.backingScaleFactor : 1.0;
 +#endif
++}
++
++static void reset_osd_render_stats(struct priv *p)
++{
++    p->osd_stats = (struct avf_osd_render_stats){.format = -1};
++}
++
++static const char *sub_bitmap_format_name(int format)
++{
++    switch (format) {
++    case SUBBITMAP_EMPTY: return "empty";
++    case SUBBITMAP_LIBASS: return "libass";
++    case SUBBITMAP_BGRA: return "bgra";
++    case -1: return "none";
++    case -2: return "mixed";
++    default: return "unknown";
++    }
++}
++
++static const char *osd_draw_path_name(int path)
++{
++    switch (path) {
++    case AVF_OSD_DRAW_DIRECT_LIBASS: return "direct-libass";
++    case AVF_OSD_DRAW_DIRECT_BGRA: return "direct-bgra";
++    case AVF_OSD_DRAW_COREGRAPHICS: return "coregraphics";
++    default: return "none";
++    }
++}
++
++static void update_subtitle_bitmap_stats(struct priv *p, struct sub_bitmaps *imgs)
++{
++    if (!imgs)
++        return;
++
++    struct avf_osd_render_stats *s = &p->osd_stats;
++    if (s->format == -1)
++        s->format = imgs->format;
++    else if (s->format != imgs->format)
++        s->format = -2;
++
++    s->parts += imgs->num_parts;
++    s->has_output |= imgs->num_parts > 0;
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        int dw = sb->dw > 0 ? sb->dw : sb->w;
++        int dh = sb->dh > 0 ? sb->dh : sb->h;
++
++        if (sb->w > 0 && sb->h > 0)
++            s->src_pixels += (int64_t)sb->w * sb->h;
++        if (dw > 0 && dh > 0)
++            s->dst_pixels += (int64_t)dw * dh;
++
++        if (dw <= 0 || dh <= 0)
++            continue;
++
++        int x0 = sb->x;
++        int y0 = sb->y;
++        int x1 = sb->x + dw;
++        int y1 = sb->y + dh;
++        if (!s->has_bbox) {
++            s->bbox_x0 = x0;
++            s->bbox_y0 = y0;
++            s->bbox_x1 = x1;
++            s->bbox_y1 = y1;
++            s->has_bbox = true;
++        } else {
++            s->bbox_x0 = MPMIN(s->bbox_x0, x0);
++            s->bbox_y0 = MPMIN(s->bbox_y0, y0);
++            s->bbox_x1 = MPMAX(s->bbox_x1, x1);
++            s->bbox_y1 = MPMAX(s->bbox_y1, y1);
++        }
++    }
 +}
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block);
@@ -203,13 +308,19 @@ index 0000000000..1b3e13aece
 +    vo->monitor_par = 1.0;
 +}
 +
-+static struct avf_render_geometry get_render_geometry(struct vo *vo, int frame_w, int frame_h)
++static int scale_osd_coord(int value, double scale)
++{
++    return scale > 0 ? MPMAX(0, (int)(value / scale + 0.5)) : value;
++}
++
++static struct avf_render_geometry compute_render_geometry(struct vo *vo,
++                                                          int frame_w,
++                                                          int frame_h)
 +{
 +    struct priv *p = vo->priv;
 +    struct mp_rect src, dst;
 +    struct mp_osd_res vo_osd;
 +
-+    update_avfoundation_geometry(vo);
 +    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
 +
 +    if (frame_w <= 0)
@@ -218,12 +329,32 @@ index 0000000000..1b3e13aece
 +        frame_h = vo->params ? vo->params->h : 0;
 +
 +    if (!p->composite_osd) {
++        int src_w = src.x1 - src.x0;
++        int src_h = src.y1 - src.y0;
++        int dst_w = dst.x1 - dst.x0;
++        int dst_h = dst.y1 - dst.y0;
++        double scale_x = src_w > 0 && dst_w > 0 ? (double)dst_w / src_w : 1.0;
++        double scale_y = src_h > 0 && dst_h > 0 ? (double)dst_h / src_h : 1.0;
++        struct mp_osd_res osd_res = vo_osd;
++
++        osd_res.w = scale_osd_coord(vo_osd.w, scale_x);
++        osd_res.h = scale_osd_coord(vo_osd.h, scale_y);
++        osd_res.ml = scale_osd_coord(vo_osd.ml, scale_x);
++        osd_res.mr = scale_osd_coord(vo_osd.mr, scale_x);
++        osd_res.mt = scale_osd_coord(vo_osd.mt, scale_y);
++        osd_res.mb = scale_osd_coord(vo_osd.mb, scale_y);
++
++        if (osd_res.w <= 0 && frame_w > 0)
++            osd_res.w = frame_w;
++        if (osd_res.h <= 0 && frame_h > 0)
++            osd_res.h = frame_h;
++
 +        return (struct avf_render_geometry){
-+            .w = vo_osd.w,
-+            .h = vo_osd.h,
++            .w = osd_res.w,
++            .h = osd_res.h,
 +            .src = src,
 +            .dst = dst,
-+            .osd_res = vo_osd,
++            .osd_res = osd_res,
 +        };
 +    }
 +
@@ -246,12 +377,45 @@ index 0000000000..1b3e13aece
 +    };
 +}
 +
++static void invalidate_render_geometry(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    p->render_geometry_valid = false;
++}
++
++static void update_render_geometry(struct vo *vo, int frame_w, int frame_h)
++{
++    struct priv *p = vo->priv;
++
++    if (frame_w <= 0)
++        frame_w = vo->params ? vo->params->w : 0;
++    if (frame_h <= 0)
++        frame_h = vo->params ? vo->params->h : 0;
++
++    update_avfoundation_geometry(vo);
++    p->render_geometry = compute_render_geometry(vo, frame_w, frame_h);
++    p->render_geometry_valid = true;
++}
++
++static struct avf_render_geometry get_render_geometry(struct vo *vo,
++                                                      int frame_w,
++                                                      int frame_h)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->render_geometry_valid)
++        update_render_geometry(vo, frame_w, frame_h);
++
++    return p->render_geometry;
++}
++
 +// Helper to sync OSD layer frame with display layer frame.
 +static void sync_osd_layer_frame(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
 +
 +    update_avfoundation_geometry(vo);
++    invalidate_render_geometry(vo);
 +
 +    if (p->composite_osd || !p->osdLayer || !p->displayLayer)
 +        return;
@@ -286,12 +450,20 @@ index 0000000000..1b3e13aece
 +        return true;
 +
 +    int64_t now = mp_time_ns();
-+    int64_t deadline = present_host_ns > 0 ? present_host_ns : now;
-+    int64_t give_up = MPMAX(deadline + MP_TIME_MS_TO_NS(8), now + MP_TIME_MS_TO_NS(2));
++    int64_t latest = present_host_ns > 0
++        ? present_host_ns - MP_TIME_MS_TO_NS(4)
++        : now + MP_TIME_MS_TO_NS(1);
++    int64_t give_up = MPMIN(now + MP_TIME_MS_TO_NS(2), latest);
++
++    if (give_up <= now) {
++        MP_VERBOSE(vo, "Display layer not ready %.2f ms before PTS; dropping frame\n",
++                   (present_host_ns - now) / 1000000.0);
++        return false;
++    }
 +
 +    while (![p->displayLayer isReadyForMoreMediaData]) {
 +        if (mp_time_ns() >= give_up) {
-+            MP_VERBOSE(vo, "Display layer not ready; dropping late frame\n");
++            MP_VERBOSE(vo, "Display layer not ready after bounded wait; dropping frame\n");
 +            return false;
 +        }
 +        mp_sleep_ns(MP_TIME_MS_TO_NS(1));
@@ -405,6 +577,90 @@ index 0000000000..1b3e13aece
 +        &p->output_pool_h, NULL, w, h, outputFormat, "composite output");
 +}
 +
++static CFStringRef get_cv_color_primaries(enum pl_color_primaries primaries)
++{
++    switch (primaries) {
++    case PL_COLOR_PRIM_BT_709:
++        return kCVImageBufferColorPrimaries_ITU_R_709_2;
++    case PL_COLOR_PRIM_BT_2020:
++        return kCVImageBufferColorPrimaries_ITU_R_2020;
++    default:
++        return NULL;
++    }
++}
++
++static CFStringRef get_cv_transfer_function(enum pl_color_transfer transfer)
++{
++    switch (transfer) {
++    case PL_COLOR_TRC_SRGB:
++        return kCVImageBufferTransferFunction_sRGB;
++    case PL_COLOR_TRC_BT_1886:
++        return kCVImageBufferTransferFunction_ITU_R_709_2;
++    case PL_COLOR_TRC_PQ:
++        return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++    case PL_COLOR_TRC_HLG:
++        return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++    default:
++        return NULL;
++    }
++}
++
++static CFStringRef get_cv_ycbcr_matrix(enum pl_color_system sys)
++{
++    switch (sys) {
++    case PL_COLOR_SYSTEM_BT_601:
++        return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++    case PL_COLOR_SYSTEM_BT_709:
++        return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++    case PL_COLOR_SYSTEM_BT_2020_NC:
++    case PL_COLOR_SYSTEM_BT_2020_C:
++    case PL_COLOR_SYSTEM_BT_2100_PQ:
++    case PL_COLOR_SYSTEM_BT_2100_HLG:
++        return kCVImageBufferYCbCrMatrix_ITU_R_2020;
++    default:
++        return NULL;
++    }
++}
++
++static void set_colorspace_from_attachments(CVPixelBufferRef pixbuf)
++{
++    CFDictionaryRef attachments = CVBufferGetAttachments(
++        pixbuf, kCVAttachmentMode_ShouldPropagate);
++    if (!attachments)
++        return;
++
++    CGColorSpaceRef colorspace = CVImageBufferCreateColorSpaceFromAttachments(attachments);
++    if (!colorspace)
++        return;
++
++    CVBufferSetAttachment(pixbuf, kCVImageBufferCGColorSpaceKey, colorspace,
++                          kCVAttachmentMode_ShouldPropagate);
++    CGColorSpaceRelease(colorspace);
++}
++
++static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
++                                            const struct mp_image_params *params)
++{
++    CFStringRef primaries = get_cv_color_primaries(params->color.primaries);
++    CFStringRef transfer = get_cv_transfer_function(params->color.transfer);
++    CFStringRef matrix = get_cv_ycbcr_matrix(params->repr.sys);
++
++    if (primaries) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferColorPrimariesKey,
++                              primaries, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (transfer) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
++                              transfer, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (matrix) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey,
++                              matrix, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (primaries || transfer || matrix)
++        set_colorspace_from_attachments(pixbuf);
++}
++
 +// Copy HDR metadata from source to destination pixel buffer
 +static void copy_hdr_metadata(CVPixelBufferRef src, CVPixelBufferRef dst)
 +{
@@ -422,6 +678,8 @@ index 0000000000..1b3e13aece
 +            CVBufferSetAttachment(dst, keys[i], value, kCVAttachmentMode_ShouldPropagate);
 +        }
 +    }
++
++    set_colorspace_from_attachments(dst);
 +}
 +
 +// Map mpv image format to CVPixelBuffer format
@@ -529,40 +787,14 @@ index 0000000000..1b3e13aece
 +    }
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    tag_pixel_buffer_color_metadata(pixbuf, &mpi->params);
 +
 +    return pixbuf;
 +}
 +
-+// Render subtitle bitmap to CGImage (used by both modes)
-+static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
++static void draw_subtitle_bitmaps(CGContextRef context, struct sub_bitmaps *imgs,
++                                  int h)
 +{
-+    struct priv *p = vo->priv;
-+
-+    if (!imgs || imgs->num_parts == 0)
-+        return NULL;
-+
-+    int w = p->osd_w;
-+    int h = p->osd_h;
-+
-+    if (w <= 0 || h <= 0)
-+        return NULL;
-+
-+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-+    if (!colorSpace)
-+        return NULL;
-+
-+    CGContextRef context = CGBitmapContextCreate(
-+        NULL, w, h, 8, w * 4, colorSpace,
-+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
-+    );
-+    CGColorSpaceRelease(colorSpace);
-+
-+    if (!context)
-+        return NULL;
-+
-+    CGContextClearRect(context, CGRectMake(0, 0, w, h));
-+
-+    // Create colorspace once for all BGRA parts (libass doesn't need it)
 +    CGColorSpaceRef partColorSpace = (imgs->format == SUBBITMAP_BGRA)
 +        ? CGColorSpaceCreateDeviceRGB() : NULL;
 +
@@ -618,6 +850,207 @@ index 0000000000..1b3e13aece
 +
 +    if (partColorSpace)
 +        CGColorSpaceRelease(partColorSpace);
++}
++
++static int get_direct_osd_draw_path(struct sub_bitmaps *imgs)
++{
++    if (!imgs || imgs->num_parts <= 0)
++        return AVF_OSD_DRAW_NONE;
++
++    int path = AVF_OSD_DRAW_NONE;
++    if (imgs->format == SUBBITMAP_LIBASS) {
++        path = AVF_OSD_DRAW_DIRECT_LIBASS;
++    } else if (imgs->format == SUBBITMAP_BGRA) {
++        path = AVF_OSD_DRAW_DIRECT_BGRA;
++    } else {
++        return AVF_OSD_DRAW_NONE;
++    }
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++
++        int dw = sb->dw > 0 ? sb->dw : sb->w;
++        int dh = sb->dh > 0 ? sb->dh : sb->h;
++        if (dw != sb->w || dh != sb->h)
++            return AVF_OSD_DRAW_COREGRAPHICS;
++    }
++
++    return path;
++}
++
++static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
++                              uint8_t *src, int src_stride,
++                              int w, int h, uint32_t color)
++{
++    const unsigned int r = (color >> 24) & 0xff;
++    const unsigned int g = (color >> 16) & 0xff;
++    const unsigned int b = (color >>  8) & 0xff;
++    const unsigned int a = 0xff - (color & 0xff);
++
++    if (!a)
++        return;
++
++    for (int y = 0; y < h; y++) {
++        uint32_t *dstrow = (uint32_t *)dst;
++        for (int x = 0; x < w; x++) {
++            const unsigned int v = src[x];
++            if (!v)
++                continue;
++
++            unsigned int aa = a * v;
++            unsigned int inv = 255 * 255 - aa;
++            uint32_t dstpix = dstrow[x];
++            unsigned int dstb =  dstpix        & 0xff;
++            unsigned int dstg = (dstpix >>  8) & 0xff;
++            unsigned int dstr = (dstpix >> 16) & 0xff;
++            unsigned int dsta = (dstpix >> 24) & 0xff;
++
++            dstb = (v * b * a + dstb * inv + 32512) / (255 * 255);
++            dstg = (v * g * a + dstg * inv + 32512) / (255 * 255);
++            dstr = (v * r * a + dstr * inv + 32512) / (255 * 255);
++            dsta = (aa * 255 + dsta * inv + 32512) / (255 * 255);
++            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
++                                 uint8_t *src, int src_stride,
++                                 int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        uint32_t *srcrow = (uint32_t *)src;
++        uint32_t *dstrow = (uint32_t *)dst;
++        for (int x = 0; x < w; x++) {
++            uint32_t srcpix = srcrow[x];
++            unsigned int srca = (srcpix >> 24) & 0xff;
++            if (!srca)
++                continue;
++            if (srca == 0xff || !dstrow[x]) {
++                dstrow[x] = srcpix;
++                continue;
++            }
++
++            uint32_t dstpix = dstrow[x];
++            unsigned int inv = 0xff - srca;
++            unsigned int srcb =  srcpix        & 0xff;
++            unsigned int srcg = (srcpix >>  8) & 0xff;
++            unsigned int srcr = (srcpix >> 16) & 0xff;
++            unsigned int dstb =  dstpix        & 0xff;
++            unsigned int dstg = (dstpix >>  8) & 0xff;
++            unsigned int dstr = (dstpix >> 16) & 0xff;
++            unsigned int dsta = (dstpix >> 24) & 0xff;
++
++            dstb = MPMIN(0xff, srcb + (dstb * inv + 127) / 255);
++            dstg = MPMIN(0xff, srcg + (dstg * inv + 127) / 255);
++            dstr = MPMIN(0xff, srcr + (dstr * inv + 127) / 255);
++            dsta = MPMIN(0xff, srca + (dsta * inv + 127) / 255);
++            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++static void draw_direct_libass_bitmap(uint8_t *base, size_t stride,
++                                      int w, int h, struct sub_bitmap *sb)
++{
++    int x0 = MPCLAMP(sb->x, 0, w);
++    int y0 = MPCLAMP(sb->y, 0, h);
++    int x1 = MPCLAMP(sb->x + sb->w, 0, w);
++    int y1 = MPCLAMP(sb->y + sb->h, 0, h);
++    int draw_w = x1 - x0;
++    int draw_h = y1 - y0;
++    if (draw_w <= 0 || draw_h <= 0)
++        return;
++
++    uint8_t *dst = base + (size_t)y0 * stride + (size_t)x0 * 4;
++    uint8_t *src = (uint8_t *)sb->bitmap + (y0 - sb->y) * sb->stride + (x0 - sb->x);
++    blend_libass_bgra(dst, stride, src, sb->stride, draw_w, draw_h, sb->libass.color);
++}
++
++static void draw_direct_bgra_bitmap(uint8_t *base, size_t stride,
++                                    int w, int h, struct sub_bitmap *sb)
++{
++    int dw = sb->dw > 0 ? sb->dw : sb->w;
++    int dh = sb->dh > 0 ? sb->dh : sb->h;
++    int x0 = MPCLAMP(sb->x, 0, w);
++    int y0 = MPCLAMP(sb->y, 0, h);
++    int x1 = MPCLAMP(sb->x + dw, 0, w);
++    int y1 = MPCLAMP(sb->y + dh, 0, h);
++    int draw_w = x1 - x0;
++    int draw_h = y1 - y0;
++    if (draw_w <= 0 || draw_h <= 0)
++        return;
++
++    uint8_t *dst = base + (size_t)y0 * stride + (size_t)x0 * 4;
++    uint8_t *src = (uint8_t *)sb->bitmap + (y0 - sb->y) * sb->stride + (size_t)(x0 - sb->x) * 4;
++    blend_bgra_over_bgra(dst, stride, src, sb->stride, draw_w, draw_h);
++}
++
++static bool draw_subtitle_bitmaps_direct(struct priv *p, uint8_t *base,
++                                         size_t stride, int w, int h,
++                                         struct sub_bitmaps *imgs)
++{
++    int path = get_direct_osd_draw_path(imgs);
++    if (path != AVF_OSD_DRAW_DIRECT_LIBASS && path != AVF_OSD_DRAW_DIRECT_BGRA)
++        return false;
++
++    p->osd_stats.draw_path = path;
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++        if (path == AVF_OSD_DRAW_DIRECT_LIBASS)
++            draw_direct_libass_bitmap(base, stride, w, h, sb);
++        else
++            draw_direct_bgra_bitmap(base, stride, w, h, sb);
++    }
++
++    return true;
++}
++
++// Render subtitle bitmap to CGImage (used by compositing mode)
++static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
++{
++    struct priv *p = vo->priv;
++
++    if (!imgs || imgs->num_parts == 0)
++        return NULL;
++
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (w <= 0 || h <= 0)
++        return NULL;
++
++    int64_t context_start = mp_time_ns();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    if (!colorSpace) {
++        p->osd_stats.context_ns += mp_time_ns() - context_start;
++        return NULL;
++    }
++
++    CGContextRef context = CGBitmapContextCreate(
++        NULL, w, h, 8, w * 4, colorSpace,
++        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
++    );
++    CGColorSpaceRelease(colorSpace);
++    p->osd_stats.context_ns += mp_time_ns() - context_start;
++
++    if (!context)
++        return NULL;
++
++    CGContextClearRect(context, CGRectMake(0, 0, w, h));
++    int64_t draw_start = mp_time_ns();
++    p->osd_stats.draw_path = AVF_OSD_DRAW_COREGRAPHICS;
++    draw_subtitle_bitmaps(context, imgs, h);
++    p->osd_stats.bitmap_draw_ns += mp_time_ns() - draw_start;
 +
 +    CGImageRef result = CGBitmapContextCreateImage(context);
 +    CGContextRelease(context);
@@ -625,7 +1058,7 @@ index 0000000000..1b3e13aece
 +    return result;
 +}
 +
-+static CVPixelBufferRef create_osd_pixel_buffer(struct vo *vo, CGImageRef image)
++static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
 +    int w = p->osd_w;
@@ -656,53 +1089,92 @@ index 0000000000..1b3e13aece
 +    }
 +    memset(base, 0, stride * h);
 +
-+    if (image) {
-+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-+        CGContextRef context = colorSpace ? CGBitmapContextCreate(
-+            base, w, h, 8, stride, colorSpace,
-+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
-+        ) : NULL;
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return pixbuf;
++}
 +
-+        if (colorSpace)
-+            CGColorSpaceRelease(colorSpace);
++static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
++                                                     struct sub_bitmaps *imgs)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
 +
-+        if (!context) {
-+            CVPixelBufferUnlockBaseAddress(pixbuf, 0);
-+            CVPixelBufferRelease(pixbuf);
-+            return NULL;
-+        }
++    if (!imgs || imgs->num_parts == 0)
++        return NULL;
 +
-+        CGContextDrawImage(context, CGRectMake(0, 0, w, h), image);
-+        CGContextRelease(context);
++    int64_t buffer_start = mp_time_ns();
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    p->osd_stats.buffer_ns += mp_time_ns() - buffer_start;
++    if (!pixbuf)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
 +    }
++
++    int64_t direct_draw_start = mp_time_ns();
++    if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++        p->osd_stats.bitmap_draw_ns += mp_time_ns() - direct_draw_start;
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        return pixbuf;
++    }
++
++    int64_t context_start = mp_time_ns();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGContextRef context = colorSpace ? CGBitmapContextCreate(
++        base, w, h, 8, stride, colorSpace,
++        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
++    ) : NULL;
++
++    if (colorSpace)
++        CGColorSpaceRelease(colorSpace);
++    p->osd_stats.context_ns += mp_time_ns() - context_start;
++
++    if (!context) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    int64_t draw_start = mp_time_ns();
++    p->osd_stats.draw_path = AVF_OSD_DRAW_COREGRAPHICS;
++    draw_subtitle_bitmaps(context, imgs, h);
++    p->osd_stats.bitmap_draw_ns += mp_time_ns() - draw_start;
++    CGContextRelease(context);
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
 +    return pixbuf;
 +}
 +
-+static bool enqueue_osd_sample(struct vo *vo, int64_t present_host_ns)
++static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
++                                                  int64_t present_host_ns,
++                                                  bool *needed)
 +{
 +    struct priv *p = vo->priv;
 +
++    if (needed)
++        *needed = false;
++
 +    if (p->composite_osd || !p->osd_needs_enqueue)
-+        return true;
++        return NULL;
 +
-+    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
-+    if (!osdLayer)
-+        return false;
++    if (needed)
++        *needed = true;
 +
-+    if (![osdLayer isReadyForMoreMediaData]) {
-+        MP_VERBOSE(vo, "OSD layer not ready; deferring subtitle sample\n");
-+        [osdLayer release];
-+        return false;
++    CVPixelBufferRef pixbuf = NULL;
++    if (p->has_subtitle && p->cachedSubtitleBuffer) {
++        pixbuf = CVPixelBufferRetain(p->cachedSubtitleBuffer);
++    } else {
++        pixbuf = create_empty_osd_pixel_buffer(vo);
 +    }
-+
-+    CVPixelBufferRef pixbuf = create_osd_pixel_buffer(vo,
-+        p->has_subtitle ? p->cachedSubtitleImage : NULL);
-+    if (!pixbuf) {
-+        [osdLayer release];
-+        return false;
-+    }
++    if (!pixbuf)
++        return NULL;
 +
 +    int64_t pts_ns = present_host_ns > 0 ? present_host_ns : mp_time_ns();
 +    CMSampleTimingInfo info = {
@@ -723,15 +1195,32 @@ index 0000000000..1b3e13aece
 +
 +    if (err != noErr || !buf) {
 +        MP_ERR(vo, "Failed to create OSD sample buffer: %d\n", (int)err);
++        return NULL;
++    }
++
++    return buf;
++}
++
++static bool enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (!buf)
++        return true;
++
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++    if (!osdLayer)
++        return false;
++
++    if (![osdLayer isReadyForMoreMediaData]) {
++        MP_VERBOSE(vo, "OSD layer not ready; dropping subtitle sample for this frame\n");
 +        [osdLayer release];
 +        return false;
 +    }
 +
 +    [osdLayer enqueueSampleBuffer:buf];
-+    CFRelease(buf);
 +    [osdLayer release];
 +
-+    p->osd_needs_enqueue = false;
 +    return true;
 +}
 +
@@ -740,63 +1229,97 @@ index 0000000000..1b3e13aece
 +{
 +    struct vo *vo = ctx;
 +    struct priv *p = vo->priv;
++    int64_t callback_start = mp_time_ns();
++
++    p->osd_stats.callbacks += 1;
 +
 +    // Mark that callback was invoked this frame
 +    p->osd_callback_invoked = true;
++    update_subtitle_bitmap_stats(p, imgs);
 +
 +    // Clear subtitles when there are none
 +    if (!imgs || imgs->num_parts == 0) {
-+        if (p->has_subtitle || p->cachedSubtitleImage) {
++        p->osd_stats.cleared = true;
++        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
 +            p->has_subtitle = false;
 +            p->osd_change_id = 0;  // Reset change_id so next subtitle renders
 +            if (p->cachedSubtitleImage) {
 +                CGImageRelease(p->cachedSubtitleImage);
 +                p->cachedSubtitleImage = NULL;
 +            }
++            if (p->cachedSubtitleBuffer) {
++                CVPixelBufferRelease(p->cachedSubtitleBuffer);
++                p->cachedSubtitleBuffer = NULL;
++            }
 +            if (!p->composite_osd)
 +                p->osd_needs_enqueue = true;
 +        }
++        p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +        return;
 +    }
 +
 +    // Skip redraw if content hasn't changed AND we already have a subtitle cached
 +    // This prevents unnecessary re-rendering but ensures we don't skip first render
-+    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id && p->has_subtitle)
++    bool has_cached_subtitle = p->composite_osd
++        ? p->cachedSubtitleImage != NULL
++        : p->cachedSubtitleBuffer != NULL;
++    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
++        p->has_subtitle && has_cached_subtitle) {
++        p->osd_stats.cache_hit = true;
++        p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +        return;
++    }
 +
++    if (p->composite_osd) {
++        CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
++        if (!subtitleImage) {
++            p->osd_stats.callback_ns += mp_time_ns() - callback_start;
++            return;
++        }
++
++        if (p->cachedSubtitleImage)
++            CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = subtitleImage;
++    } else {
++        CVPixelBufferRef subtitleBuffer = render_subtitle_pixel_buffer(vo, imgs);
++        if (!subtitleBuffer) {
++            p->osd_stats.callback_ns += mp_time_ns() - callback_start;
++            return;
++        }
++
++        if (p->cachedSubtitleBuffer)
++            CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = subtitleBuffer;
++    }
++
++    p->osd_stats.rendered = true;
 +    p->osd_change_id = imgs->change_id;
-+
-+    CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
-+    if (!subtitleImage)
-+        return;
-+
-+    if (p->cachedSubtitleImage)
-+        CGImageRelease(p->cachedSubtitleImage);
-+    p->cachedSubtitleImage = subtitleImage;
 +    p->has_subtitle = true;
 +    if (!p->composite_osd)
 +        p->osd_needs_enqueue = true;
++    p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +}
 +
-+// Render OSD/subtitles
-+static void render_osd(struct vo *vo, double pts)
++// Render OSD/subtitles for an already computed geometry.
++static bool render_osd_with_geometry(struct vo *vo, double pts,
++                                     struct avf_render_geometry geometry,
++                                     int64_t geometry_ns)
 +{
 +    struct priv *p = vo->priv;
++    reset_osd_render_stats(p);
 +
 +    if (!vo->osd)
-+        return;
++        return false;
 +
 +    // In composite mode, we don't need the osdLayer
 +    if (!p->composite_osd && !p->osdLayer)
-+        return;
++        return false;
 +
-+    int frame_w = p->next_image ? p->next_image->w : 0;
-+    int frame_h = p->next_image ? p->next_image->h : 0;
-+    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
++    p->osd_stats.geometry_ns = geometry_ns;
 +    struct mp_osd_res osd_res = geometry.osd_res;
 +
 +    if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
-+        return;
++        return false;
 +
 +    if (!osd_res_equals(p->osd_res, osd_res)) {
 +        p->osd_res = osd_res;
@@ -813,7 +1336,9 @@ index 0000000000..1b3e13aece
 +    // Reset flag before calling osd_draw
 +    p->osd_callback_invoked = false;
 +
++    int64_t osd_draw_start = mp_time_ns();
 +    osd_draw(vo->osd, osd_res, pts, 0, formats, draw_osd_cb, vo);
++    p->osd_stats.osd_draw_ns = mp_time_ns() - osd_draw_start;
 +
 +    // If callback wasn't invoked, there are no subtitles for this PTS
 +    // Clear any cached subtitle state
@@ -824,9 +1349,29 @@ index 0000000000..1b3e13aece
 +            CGImageRelease(p->cachedSubtitleImage);
 +            p->cachedSubtitleImage = NULL;
 +        }
++        if (p->cachedSubtitleBuffer) {
++            CVPixelBufferRelease(p->cachedSubtitleBuffer);
++            p->cachedSubtitleBuffer = NULL;
++        }
 +        if (!p->composite_osd)
 +            p->osd_needs_enqueue = true;
 +    }
++
++    return true;
++}
++
++// Render OSD/subtitles synchronously. Used only by compositing mode, where the
++// subtitle image must exist before the video frame can be composited.
++static void render_osd(struct vo *vo, double pts)
++{
++    struct priv *p = vo->priv;
++    int64_t geometry_start = mp_time_ns();
++    int frame_w = p->next_image ? p->next_image->w : 0;
++    int frame_h = p->next_image ? p->next_image->h : 0;
++    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
++    int64_t geometry_ns = mp_time_ns() - geometry_start;
++
++    render_osd_with_geometry(vo, pts, geometry, geometry_ns);
 +}
 +
 +// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
@@ -985,7 +1530,7 @@ index 0000000000..1b3e13aece
 +        displayLayer.controlTimebase = timebase;
 +    });
 +    [displayLayer release];
-+    vo_set_queue_params(vo, 16 * 1000 * 1000, 1);
++    vo_set_queue_params(vo, 128 * 1000 * 1000, 1);
 +    update_avfoundation_geometry(vo);
 +
 +    // Setup Metal and Core Image for compositing mode (HDR-compatible)
@@ -1072,13 +1617,10 @@ index 0000000000..1b3e13aece
 +    return 0;
 +}
 +
-+static bool enqueue_frame(struct vo *vo, mp_image_t *mpi)
++static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *mpi)
 +{
 +    @autoreleasepool {
 +        struct priv *p = vo->priv;
-+
-+        if (!wait_until_ready_for_more_media_data(vo, p->next_present_host_ns))
-+            return false;
 +
 +        CVPixelBufferRef pixbuf = NULL;
 +        bool pixbufNeedsRelease = false;
@@ -1092,7 +1634,7 @@ index 0000000000..1b3e13aece
 +            pixbuf = upload_software_frame(vo, mpi);
 +            if (!pixbuf) {
 +                MP_ERR(vo, "Failed to upload software frame\n");
-+                return false;
++                return NULL;
 +            }
 +            pixbufNeedsRelease = true;
 +        }
@@ -1124,7 +1666,7 @@ index 0000000000..1b3e13aece
 +                CVPixelBufferRelease(finalBuffer);
 +            if (pixbufNeedsRelease)
 +                CVPixelBufferRelease(pixbuf);
-+            return false;
++            return NULL;
 +        }
 +
 +        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, finalBuffer, format, &info, &buf);
@@ -1136,11 +1678,8 @@ index 0000000000..1b3e13aece
 +                CVPixelBufferRelease(finalBuffer);
 +            if (pixbufNeedsRelease)
 +                CVPixelBufferRelease(pixbuf);
-+            return false;
++            return NULL;
 +        }
-+
-+        [p->displayLayer enqueueSampleBuffer:buf];
-+        CFRelease(buf);
 +
 +        // Release composited output buffer (always owned by us)
 +        if (needsRelease)
@@ -1150,7 +1689,74 @@ index 0000000000..1b3e13aece
 +        if (pixbufNeedsRelease)
 +            CVPixelBufferRelease(pixbuf);
 +
-+        return true;
++        return buf;
++    }
++}
++
++static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (!buf)
++        return false;
++
++    [p->displayLayer enqueueSampleBuffer:buf];
++    return true;
++}
++
++static void log_flip_timing(struct vo *vo, int64_t present_host_ns,
++                            int64_t start_ns, int64_t osd_done_ns,
++                            int64_t osd_sample_done_ns,
++                            int64_t video_sample_done_ns,
++                            int64_t done_ns, bool osd_needed,
++                            bool osd_enqueued, bool video_enqueued)
++{
++    struct priv *p = vo->priv;
++    int64_t total_ns = done_ns - start_ns;
++    int64_t margin_ns = present_host_ns - done_ns;
++
++    if (osd_enqueued && video_enqueued && total_ns < MP_TIME_MS_TO_NS(16) &&
++        margin_ns > MP_TIME_MS_TO_NS(4))
++        return;
++
++    MP_VERBOSE(vo,
++        "AVF flip timing: render=%.2fms osd-sample=%.2fms video-sample=%.2fms total=%.2fms margin=%.2fms osd=%s video=%s\n",
++        (osd_done_ns - start_ns) / 1000000.0,
++        (osd_sample_done_ns - osd_done_ns) / 1000000.0,
++        (video_sample_done_ns - osd_sample_done_ns) / 1000000.0,
++        total_ns / 1000000.0,
++        margin_ns / 1000000.0,
++        osd_needed ? (osd_enqueued ? "enqueued" : "missed") : "none",
++        video_enqueued ? "enqueued" : "missed");
++
++    struct avf_osd_render_stats *s = &p->osd_stats;
++    if (s->geometry_ns || s->osd_draw_ns || s->callbacks) {
++        int64_t internal_ns = s->osd_draw_ns > s->callback_ns
++            ? s->osd_draw_ns - s->callback_ns : 0;
++        int bbox_w = s->has_bbox ? s->bbox_x1 - s->bbox_x0 : 0;
++        int bbox_h = s->has_bbox ? s->bbox_y1 - s->bbox_y0 : 0;
++
++        MP_VERBOSE(vo,
++            "AVF render detail: geometry=%.2fms osd-draw=%.2fms mpv-libass=%.2fms callback=%.2fms buffer=%.2fms context=%.2fms bitmap=%.2fms callbacks=%d parts=%d format=%s path=%s src-px=%lld dst-px=%lld bbox=%dx%d state=%s%s%s%s\n",
++            s->geometry_ns / 1000000.0,
++            s->osd_draw_ns / 1000000.0,
++            internal_ns / 1000000.0,
++            s->callback_ns / 1000000.0,
++            s->buffer_ns / 1000000.0,
++            s->context_ns / 1000000.0,
++            s->bitmap_draw_ns / 1000000.0,
++            s->callbacks,
++            s->parts,
++            sub_bitmap_format_name(s->format),
++            osd_draw_path_name(s->draw_path),
++            (long long)s->src_pixels,
++            (long long)s->dst_pixels,
++            bbox_w,
++            bbox_h,
++            s->has_output ? "output" : "empty",
++            s->rendered ? ",rendered" : "",
++            s->cache_hit ? ",cache-hit" : "",
++            s->cleared ? ",cleared" : "");
 +    }
 +}
 +
@@ -1159,10 +1765,44 @@ index 0000000000..1b3e13aece
 +    struct priv *p = vo->priv;
 +
 +    if (p->next_image) {
++        int64_t start_ns = mp_time_ns();
++        CMSampleBufferRef osd_buf = NULL;
++        bool osd_needed = false;
++
 +        render_osd(vo, p->next_pts);
-+        bool enqueued = enqueue_frame(vo, p->next_image);
-+        if (enqueued && !p->composite_osd)
-+            enqueue_osd_sample(vo, p->next_present_host_ns);
++        int64_t osd_done_ns = mp_time_ns();
++
++        osd_buf = create_osd_sample_buffer(vo,
++            p->next_present_host_ns, &osd_needed);
++        int64_t osd_sample_done_ns = mp_time_ns();
++
++        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
++        int64_t video_sample_done_ns = mp_time_ns();
++
++        bool osd_enqueued = !osd_needed;
++        bool video_enqueued = false;
++
++        if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
++            if (osd_buf) {
++                osd_enqueued = enqueue_osd_sample(vo, osd_buf);
++                if (osd_enqueued)
++                    p->osd_needs_enqueue = false;
++            }
++
++            video_enqueued = enqueue_video_sample(vo, video_buf);
++        }
++
++        if (osd_needed && !osd_enqueued)
++            p->osd_change_id = 0;
++
++        if (osd_buf)
++            CFRelease(osd_buf);
++        if (video_buf)
++            CFRelease(video_buf);
++
++        log_flip_timing(vo, p->next_present_host_ns, start_ns, osd_done_ns,
++            osd_sample_done_ns, video_sample_done_ns, mp_time_ns(), osd_needed,
++            osd_enqueued, video_enqueued);
 +    }
 +
 +    // Flush excess buffers every ~60 frames to prevent memory growth
@@ -1220,18 +1860,29 @@ index 0000000000..1b3e13aece
 +    }
 +}
 +
++static void clear_subtitle_cache(struct priv *p)
++{
++    if (p->cachedSubtitleImage) {
++        CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = NULL;
++    }
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
++    }
++    p->has_subtitle = false;
++    p->osd_change_id = 0;
++    p->osd_needs_enqueue = false;
++    p->osd_callback_invoked = false;
++    reset_osd_render_stats(p);
++}
++
 +// Helper to clear all subtitle state (called on video change/stop)
 +static void clear_subtitle_state(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
 +
-+    if (p->cachedSubtitleImage) {
-+        CGImageRelease(p->cachedSubtitleImage);
-+        p->cachedSubtitleImage = NULL;
-+    }
-+    p->has_subtitle = false;
-+    p->osd_change_id = 0;
-+    p->osd_needs_enqueue = false;
++    clear_subtitle_cache(p);
 +
 +    if (!p->composite_osd && p->osdLayer) {
 +        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
@@ -1279,6 +1930,11 @@ index 0000000000..1b3e13aece
 +    if (p->cachedSubtitleImage) {
 +        CGImageRelease(p->cachedSubtitleImage);
 +        p->cachedSubtitleImage = NULL;
++    }
++
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
 +    }
 +
 +    if (p->outputPool) {
@@ -1366,5 +2022,3 @@ index 0000000000..1b3e13aece
 +    .options = options,
 +    .options_prefix = "avfoundation",
 +};
---
-2.50.1 (Apple Git-155)
