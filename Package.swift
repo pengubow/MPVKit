@@ -181,8 +181,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libmpv.xcframework.zip",
-            checksum: "d664fe40b0267a1f12887f6e727fbb6ca9547886c6cbbe1d0582f6cb0d2cb14e"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libmpv.xcframework.zip",
+            checksum: "674f0ade38998da15fa33b35f7fb0e0418143ddd487fad12dd85768b63051b42"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

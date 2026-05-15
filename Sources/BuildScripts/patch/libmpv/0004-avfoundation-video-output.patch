@@ -7,8 +7,8 @@ Subject: [PATCH] AVfoundation video output
  meson.build                 |   15 +
  meson.options               |    1 +
  video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 1944 +++++++++++++++++++++++++++++++++++
- 4 files changed, 1964 insertions(+)
+ video/out/vo_avfoundation.m | 1745 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 1765 insertions(+)
  create mode 100644 video/out/vo_avfoundation.m
 
 diff --git a/meson.build b/meson.build
@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,1944 @@
+@@ -0,0 +1,1745 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -132,27 +132,6 @@ index 0000000000..1b3e13aece
 +    AVF_OSD_DRAW_COREGRAPHICS,
 +};
 +
-+struct avf_osd_render_stats {
-+    int64_t geometry_ns;
-+    int64_t osd_draw_ns;
-+    int64_t callback_ns;
-+    int64_t buffer_ns;
-+    int64_t context_ns;
-+    int64_t bitmap_draw_ns;
-+    int callbacks;
-+    int parts;
-+    int format;
-+    int draw_path;
-+    int64_t src_pixels;
-+    int64_t dst_pixels;
-+    int bbox_x0, bbox_y0, bbox_x1, bbox_y1;
-+    bool has_bbox;
-+    bool has_output;
-+    bool cache_hit;
-+    bool rendered;
-+    bool cleared;
-+};
-+
 +struct priv {
 +    struct mp_hwdec_ctx hwctx;
 +
@@ -168,7 +147,6 @@ index 0000000000..1b3e13aece
 +    int osd_w, osd_h;
 +    struct mp_osd_res osd_res;
 +    struct avf_render_geometry render_geometry;
-+    struct avf_osd_render_stats osd_stats;
 +    bool render_geometry_valid;
 +    CVPixelBufferPoolRef osdPool;
 +    int osd_pool_w, osd_pool_h;
@@ -191,6 +169,7 @@ index 0000000000..1b3e13aece
 +
 +    // Frame counter for periodic maintenance
 +    int frame_count;
++    int queue_lead_ms;
 +
 +    // Track if OSD callback was invoked this frame
 +    bool osd_callback_invoked;
@@ -205,79 +184,6 @@ index 0000000000..1b3e13aece
 +    NSScreen *screen = [NSScreen mainScreen];
 +    return screen ? screen.backingScaleFactor : 1.0;
 +#endif
-+}
-+
-+static void reset_osd_render_stats(struct priv *p)
-+{
-+    p->osd_stats = (struct avf_osd_render_stats){.format = -1};
-+}
-+
-+static const char *sub_bitmap_format_name(int format)
-+{
-+    switch (format) {
-+    case SUBBITMAP_EMPTY: return "empty";
-+    case SUBBITMAP_LIBASS: return "libass";
-+    case SUBBITMAP_BGRA: return "bgra";
-+    case -1: return "none";
-+    case -2: return "mixed";
-+    default: return "unknown";
-+    }
-+}
-+
-+static const char *osd_draw_path_name(int path)
-+{
-+    switch (path) {
-+    case AVF_OSD_DRAW_DIRECT_LIBASS: return "direct-libass";
-+    case AVF_OSD_DRAW_DIRECT_BGRA: return "direct-bgra";
-+    case AVF_OSD_DRAW_COREGRAPHICS: return "coregraphics";
-+    default: return "none";
-+    }
-+}
-+
-+static void update_subtitle_bitmap_stats(struct priv *p, struct sub_bitmaps *imgs)
-+{
-+    if (!imgs)
-+        return;
-+
-+    struct avf_osd_render_stats *s = &p->osd_stats;
-+    if (s->format == -1)
-+        s->format = imgs->format;
-+    else if (s->format != imgs->format)
-+        s->format = -2;
-+
-+    s->parts += imgs->num_parts;
-+    s->has_output |= imgs->num_parts > 0;
-+
-+    for (int i = 0; i < imgs->num_parts; i++) {
-+        struct sub_bitmap *sb = &imgs->parts[i];
-+        int dw = sb->dw > 0 ? sb->dw : sb->w;
-+        int dh = sb->dh > 0 ? sb->dh : sb->h;
-+
-+        if (sb->w > 0 && sb->h > 0)
-+            s->src_pixels += (int64_t)sb->w * sb->h;
-+        if (dw > 0 && dh > 0)
-+            s->dst_pixels += (int64_t)dw * dh;
-+
-+        if (dw <= 0 || dh <= 0)
-+            continue;
-+
-+        int x0 = sb->x;
-+        int y0 = sb->y;
-+        int x1 = sb->x + dw;
-+        int y1 = sb->y + dh;
-+        if (!s->has_bbox) {
-+            s->bbox_x0 = x0;
-+            s->bbox_y0 = y0;
-+            s->bbox_x1 = x1;
-+            s->bbox_y1 = y1;
-+            s->has_bbox = true;
-+        } else {
-+            s->bbox_x0 = MPMIN(s->bbox_x0, x0);
-+            s->bbox_y0 = MPMIN(s->bbox_y0, y0);
-+            s->bbox_x1 = MPMAX(s->bbox_x1, x1);
-+            s->bbox_y1 = MPMAX(s->bbox_y1, y1);
-+        }
-+    }
 +}
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block);
@@ -1000,8 +906,6 @@ index 0000000000..1b3e13aece
 +    if (path != AVF_OSD_DRAW_DIRECT_LIBASS && path != AVF_OSD_DRAW_DIRECT_BGRA)
 +        return false;
 +
-+    p->osd_stats.draw_path = path;
-+
 +    for (int i = 0; i < imgs->num_parts; i++) {
 +        struct sub_bitmap *sb = &imgs->parts[i];
 +        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
@@ -1029,28 +933,21 @@ index 0000000000..1b3e13aece
 +    if (w <= 0 || h <= 0)
 +        return NULL;
 +
-+    int64_t context_start = mp_time_ns();
 +    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-+    if (!colorSpace) {
-+        p->osd_stats.context_ns += mp_time_ns() - context_start;
++    if (!colorSpace)
 +        return NULL;
-+    }
 +
 +    CGContextRef context = CGBitmapContextCreate(
 +        NULL, w, h, 8, w * 4, colorSpace,
 +        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
 +    );
 +    CGColorSpaceRelease(colorSpace);
-+    p->osd_stats.context_ns += mp_time_ns() - context_start;
 +
 +    if (!context)
 +        return NULL;
 +
 +    CGContextClearRect(context, CGRectMake(0, 0, w, h));
-+    int64_t draw_start = mp_time_ns();
-+    p->osd_stats.draw_path = AVF_OSD_DRAW_COREGRAPHICS;
 +    draw_subtitle_bitmaps(context, imgs, h);
-+    p->osd_stats.bitmap_draw_ns += mp_time_ns() - draw_start;
 +
 +    CGImageRef result = CGBitmapContextCreateImage(context);
 +    CGContextRelease(context);
@@ -1103,9 +1000,7 @@ index 0000000000..1b3e13aece
 +    if (!imgs || imgs->num_parts == 0)
 +        return NULL;
 +
-+    int64_t buffer_start = mp_time_ns();
 +    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
-+    p->osd_stats.buffer_ns += mp_time_ns() - buffer_start;
 +    if (!pixbuf)
 +        return NULL;
 +
@@ -1118,14 +1013,11 @@ index 0000000000..1b3e13aece
 +        return NULL;
 +    }
 +
-+    int64_t direct_draw_start = mp_time_ns();
 +    if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
-+        p->osd_stats.bitmap_draw_ns += mp_time_ns() - direct_draw_start;
 +        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
 +        return pixbuf;
 +    }
 +
-+    int64_t context_start = mp_time_ns();
 +    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
 +    CGContextRef context = colorSpace ? CGBitmapContextCreate(
 +        base, w, h, 8, stride, colorSpace,
@@ -1134,7 +1026,6 @@ index 0000000000..1b3e13aece
 +
 +    if (colorSpace)
 +        CGColorSpaceRelease(colorSpace);
-+    p->osd_stats.context_ns += mp_time_ns() - context_start;
 +
 +    if (!context) {
 +        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
@@ -1142,10 +1033,7 @@ index 0000000000..1b3e13aece
 +        return NULL;
 +    }
 +
-+    int64_t draw_start = mp_time_ns();
-+    p->osd_stats.draw_path = AVF_OSD_DRAW_COREGRAPHICS;
 +    draw_subtitle_bitmaps(context, imgs, h);
-+    p->osd_stats.bitmap_draw_ns += mp_time_ns() - draw_start;
 +    CGContextRelease(context);
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
@@ -1229,17 +1117,12 @@ index 0000000000..1b3e13aece
 +{
 +    struct vo *vo = ctx;
 +    struct priv *p = vo->priv;
-+    int64_t callback_start = mp_time_ns();
-+
-+    p->osd_stats.callbacks += 1;
 +
 +    // Mark that callback was invoked this frame
 +    p->osd_callback_invoked = true;
-+    update_subtitle_bitmap_stats(p, imgs);
 +
 +    // Clear subtitles when there are none
 +    if (!imgs || imgs->num_parts == 0) {
-+        p->osd_stats.cleared = true;
 +        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
 +            p->has_subtitle = false;
 +            p->osd_change_id = 0;  // Reset change_id so next subtitle renders
@@ -1254,7 +1137,6 @@ index 0000000000..1b3e13aece
 +            if (!p->composite_osd)
 +                p->osd_needs_enqueue = true;
 +        }
-+        p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +        return;
 +    }
 +
@@ -1265,48 +1147,38 @@ index 0000000000..1b3e13aece
 +        : p->cachedSubtitleBuffer != NULL;
 +    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
 +        p->has_subtitle && has_cached_subtitle) {
-+        p->osd_stats.cache_hit = true;
-+        p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +        return;
 +    }
 +
 +    if (p->composite_osd) {
 +        CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
-+        if (!subtitleImage) {
-+            p->osd_stats.callback_ns += mp_time_ns() - callback_start;
++        if (!subtitleImage)
 +            return;
-+        }
 +
 +        if (p->cachedSubtitleImage)
 +            CGImageRelease(p->cachedSubtitleImage);
 +        p->cachedSubtitleImage = subtitleImage;
 +    } else {
 +        CVPixelBufferRef subtitleBuffer = render_subtitle_pixel_buffer(vo, imgs);
-+        if (!subtitleBuffer) {
-+            p->osd_stats.callback_ns += mp_time_ns() - callback_start;
++        if (!subtitleBuffer)
 +            return;
-+        }
 +
 +        if (p->cachedSubtitleBuffer)
 +            CVPixelBufferRelease(p->cachedSubtitleBuffer);
 +        p->cachedSubtitleBuffer = subtitleBuffer;
 +    }
 +
-+    p->osd_stats.rendered = true;
 +    p->osd_change_id = imgs->change_id;
 +    p->has_subtitle = true;
 +    if (!p->composite_osd)
 +        p->osd_needs_enqueue = true;
-+    p->osd_stats.callback_ns += mp_time_ns() - callback_start;
 +}
 +
 +// Render OSD/subtitles for an already computed geometry.
 +static bool render_osd_with_geometry(struct vo *vo, double pts,
-+                                     struct avf_render_geometry geometry,
-+                                     int64_t geometry_ns)
++                                     struct avf_render_geometry geometry)
 +{
 +    struct priv *p = vo->priv;
-+    reset_osd_render_stats(p);
 +
 +    if (!vo->osd)
 +        return false;
@@ -1315,7 +1187,6 @@ index 0000000000..1b3e13aece
 +    if (!p->composite_osd && !p->osdLayer)
 +        return false;
 +
-+    p->osd_stats.geometry_ns = geometry_ns;
 +    struct mp_osd_res osd_res = geometry.osd_res;
 +
 +    if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
@@ -1336,9 +1207,7 @@ index 0000000000..1b3e13aece
 +    // Reset flag before calling osd_draw
 +    p->osd_callback_invoked = false;
 +
-+    int64_t osd_draw_start = mp_time_ns();
 +    osd_draw(vo->osd, osd_res, pts, 0, formats, draw_osd_cb, vo);
-+    p->osd_stats.osd_draw_ns = mp_time_ns() - osd_draw_start;
 +
 +    // If callback wasn't invoked, there are no subtitles for this PTS
 +    // Clear any cached subtitle state
@@ -1360,18 +1229,15 @@ index 0000000000..1b3e13aece
 +    return true;
 +}
 +
-+// Render OSD/subtitles synchronously. Used only by compositing mode, where the
-+// subtitle image must exist before the video frame can be composited.
++// Render OSD/subtitles synchronously so timed clear samples are never skipped.
 +static void render_osd(struct vo *vo, double pts)
 +{
 +    struct priv *p = vo->priv;
-+    int64_t geometry_start = mp_time_ns();
 +    int frame_w = p->next_image ? p->next_image->w : 0;
 +    int frame_h = p->next_image ? p->next_image->h : 0;
 +    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
-+    int64_t geometry_ns = mp_time_ns() - geometry_start;
 +
-+    render_osd_with_geometry(vo, pts, geometry, geometry_ns);
++    render_osd_with_geometry(vo, pts, geometry);
 +}
 +
 +// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
@@ -1530,7 +1396,7 @@ index 0000000000..1b3e13aece
 +        displayLayer.controlTimebase = timebase;
 +    });
 +    [displayLayer release];
-+    vo_set_queue_params(vo, 128 * 1000 * 1000, 1);
++    vo_set_queue_params(vo, (int64_t)p->queue_lead_ms * 1000 * 1000, 1);
 +    update_avfoundation_geometry(vo);
 +
 +    // Setup Metal and Core Image for compositing mode (HDR-compatible)
@@ -1704,83 +1570,22 @@ index 0000000000..1b3e13aece
 +    return true;
 +}
 +
-+static void log_flip_timing(struct vo *vo, int64_t present_host_ns,
-+                            int64_t start_ns, int64_t osd_done_ns,
-+                            int64_t osd_sample_done_ns,
-+                            int64_t video_sample_done_ns,
-+                            int64_t done_ns, bool osd_needed,
-+                            bool osd_enqueued, bool video_enqueued)
-+{
-+    struct priv *p = vo->priv;
-+    int64_t total_ns = done_ns - start_ns;
-+    int64_t margin_ns = present_host_ns - done_ns;
-+
-+    if (osd_enqueued && video_enqueued && total_ns < MP_TIME_MS_TO_NS(16) &&
-+        margin_ns > MP_TIME_MS_TO_NS(4))
-+        return;
-+
-+    MP_VERBOSE(vo,
-+        "AVF flip timing: render=%.2fms osd-sample=%.2fms video-sample=%.2fms total=%.2fms margin=%.2fms osd=%s video=%s\n",
-+        (osd_done_ns - start_ns) / 1000000.0,
-+        (osd_sample_done_ns - osd_done_ns) / 1000000.0,
-+        (video_sample_done_ns - osd_sample_done_ns) / 1000000.0,
-+        total_ns / 1000000.0,
-+        margin_ns / 1000000.0,
-+        osd_needed ? (osd_enqueued ? "enqueued" : "missed") : "none",
-+        video_enqueued ? "enqueued" : "missed");
-+
-+    struct avf_osd_render_stats *s = &p->osd_stats;
-+    if (s->geometry_ns || s->osd_draw_ns || s->callbacks) {
-+        int64_t internal_ns = s->osd_draw_ns > s->callback_ns
-+            ? s->osd_draw_ns - s->callback_ns : 0;
-+        int bbox_w = s->has_bbox ? s->bbox_x1 - s->bbox_x0 : 0;
-+        int bbox_h = s->has_bbox ? s->bbox_y1 - s->bbox_y0 : 0;
-+
-+        MP_VERBOSE(vo,
-+            "AVF render detail: geometry=%.2fms osd-draw=%.2fms mpv-libass=%.2fms callback=%.2fms buffer=%.2fms context=%.2fms bitmap=%.2fms callbacks=%d parts=%d format=%s path=%s src-px=%lld dst-px=%lld bbox=%dx%d state=%s%s%s%s\n",
-+            s->geometry_ns / 1000000.0,
-+            s->osd_draw_ns / 1000000.0,
-+            internal_ns / 1000000.0,
-+            s->callback_ns / 1000000.0,
-+            s->buffer_ns / 1000000.0,
-+            s->context_ns / 1000000.0,
-+            s->bitmap_draw_ns / 1000000.0,
-+            s->callbacks,
-+            s->parts,
-+            sub_bitmap_format_name(s->format),
-+            osd_draw_path_name(s->draw_path),
-+            (long long)s->src_pixels,
-+            (long long)s->dst_pixels,
-+            bbox_w,
-+            bbox_h,
-+            s->has_output ? "output" : "empty",
-+            s->rendered ? ",rendered" : "",
-+            s->cache_hit ? ",cache-hit" : "",
-+            s->cleared ? ",cleared" : "");
-+    }
-+}
-+
 +static void flip_page(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
 +
 +    if (p->next_image) {
-+        int64_t start_ns = mp_time_ns();
 +        CMSampleBufferRef osd_buf = NULL;
 +        bool osd_needed = false;
 +
 +        render_osd(vo, p->next_pts);
-+        int64_t osd_done_ns = mp_time_ns();
 +
 +        osd_buf = create_osd_sample_buffer(vo,
 +            p->next_present_host_ns, &osd_needed);
-+        int64_t osd_sample_done_ns = mp_time_ns();
 +
 +        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
-+        int64_t video_sample_done_ns = mp_time_ns();
 +
 +        bool osd_enqueued = !osd_needed;
-+        bool video_enqueued = false;
 +
 +        if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
 +            if (osd_buf) {
@@ -1789,7 +1594,7 @@ index 0000000000..1b3e13aece
 +                    p->osd_needs_enqueue = false;
 +            }
 +
-+            video_enqueued = enqueue_video_sample(vo, video_buf);
++            enqueue_video_sample(vo, video_buf);
 +        }
 +
 +        if (osd_needed && !osd_enqueued)
@@ -1799,10 +1604,6 @@ index 0000000000..1b3e13aece
 +            CFRelease(osd_buf);
 +        if (video_buf)
 +            CFRelease(video_buf);
-+
-+        log_flip_timing(vo, p->next_present_host_ns, start_ns, osd_done_ns,
-+            osd_sample_done_ns, video_sample_done_ns, mp_time_ns(), osd_needed,
-+            osd_enqueued, video_enqueued);
 +    }
 +
 +    // Flush excess buffers every ~60 frames to prevent memory growth
@@ -1874,7 +1675,6 @@ index 0000000000..1b3e13aece
 +    p->osd_change_id = 0;
 +    p->osd_needs_enqueue = false;
 +    p->osd_callback_invoked = false;
-+    reset_osd_render_stats(p);
 +}
 +
 +// Helper to clear all subtitle state (called on video change/stop)
@@ -2004,6 +1804,7 @@ index 0000000000..1b3e13aece
 +#define OPT_BASE_STRUCT struct priv
 +static const struct m_option options[] = {
 +    {"composite-osd", OPT_BOOL(composite_osd)},
++    {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000), OPTDEF_INT(128)},
 +    {0},
 +};
 +
